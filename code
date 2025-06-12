@@ -1,0 +1,143 @@
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+from stable_baselines3 import SAC
+from stable_baselines3.common.env_checker import check_env
+import pandas as pd
+import torch
+
+np.random.seed(42)
+torch.manual_seed(42)
+
+class DeepSeaMiningEnv(gym.Env):
+    def __init__(self, terrain_std=5):
+        super(DeepSeaMiningEnv, self).__init__()
+        self.observation_space = spaces.Box(
+            low=np.array([-10, 0, 0, 0.1], dtype=np.float32),
+            high=np.array([10, 1, 10, 1.0], dtype=np.float32),
+            dtype=np.float32
+        )
+        self.action_space = spaces.Box(
+            low=np.array([-1, -1], dtype=np.float32),
+            high=np.array([1, 1], dtype=np.float32),
+            dtype=np.float32
+        )
+        self.state = None
+        self.step_count = 0
+        self.max_cycles = 200  # 总采集周期（分钟）
+        self.terrain_std = terrain_std
+        self.max_collection_rate = 15.0  # 每分钟最大采集率（kg/min）
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.state = np.array([
+            np.random.uniform(-10, 10),
+            np.random.uniform(0.4, 1.0),
+            np.random.uniform(0, 10),
+            np.random.uniform(0.1, 1.0)
+        ], dtype=np.float32)
+        self.step_count = 0
+        return self.state, {}
+
+    def step(self, action):
+        height = 0.45 * (action[0] + 1) + 0.1
+        pressure = 5 * (action[1] + 1)
+        angle, shear_strength, current_pressure, current_height = self.state
+
+        angle += np.random.normal(0, self.terrain_std)
+        angle = np.clip(angle, -10, 10)
+        shear_strength = np.clip(shear_strength + np.random.normal(0, 0.03), 0.4, 1.0)
+
+        terrain_factor = max(0.5, 1 - (abs(angle) / 10) * 0.3)
+        pressure_factor = min(1.5, pressure / 5)
+        base_collection = self.max_collection_rate * shear_strength * terrain_factor * pressure_factor
+        collection_amount = base_collection * np.random.uniform(0.9, 1.1)  # 每分钟采集量（kg）
+
+        # 奖励函数（仍包含能耗惩罚）
+        reward = collection_amount - 0.003 * pressure ** 2 - 0.1 * (height - 0.2) ** 2
+
+        self.state = np.array([angle, shear_strength, pressure, height], dtype=np.float32)
+        self.step_count += 1
+        done = self.step_count >= self.max_cycles
+        truncated = False
+        return self.state, reward, done, truncated, {'collection_amount': collection_amount}
+
+def run_fixed_strategy(env, height=0.5, pressure=5):
+    total_collection = 0
+    obs, _ = env.reset()
+    for _ in range(env.max_cycles):
+        norm_height = (height - 0.1) / 0.45 - 1
+        norm_pressure = pressure / 5 - 1
+        action = np.array([norm_height, norm_pressure], dtype=np.float32)
+        obs, reward, done, truncated, info = env.step(action)
+        total_collection += info['collection_amount']
+        if done or truncated:
+            break
+    return total_collection
+
+def run_experiment(terrain_std, scenario_name):
+    env = DeepSeaMiningEnv(terrain_std=terrain_std)
+    check_env(env, warn=True)
+
+    model = SAC("MlpPolicy", env, verbose=0, gamma=0.95, learning_rate=0.0003,
+                tau=0.005, target_entropy='auto', device='cuda' if torch.cuda.is_available() else 'cpu', seed=42)
+    model.learn(total_timesteps=30000)
+
+    # SAC 策略总采集量
+    sac_total_collection = 0
+    obs, _ = env.reset()
+    for _ in range(env.max_cycles):
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, done, truncated, info = env.step(action)
+        sac_total_collection += info['collection_amount']
+        if done or truncated:
+            break
+
+    # 固定策略总采集量
+    fixed_total_collection = run_fixed_strategy(env)
+
+    # 计算多次运行的均值和方差
+    sac_collections = []
+    fixed_collections = []
+    for _ in range(5):  # 重复5次以计算方差
+        # SAC
+        total = 0
+        obs, _ = env.reset()
+        for _ in range(env.max_cycles):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, truncated, info = env.step(action)
+            total += info['collection_amount']
+            if done or truncated:
+                break
+        sac_collections.append(total)
+
+        # 固定策略
+        fixed_collections.append(run_fixed_strategy(env))
+
+    sac_mean = np.mean(sac_collections)
+    sac_var = np.var(sac_collections)
+    fixed_mean = np.mean(fixed_collections)
+    fixed_var = np.var(fixed_collections)
+
+    return {
+        'scenario': scenario_name,
+        'sac_mean': sac_mean,
+        'sac_var': sac_var,
+        'fixed_mean': fixed_mean,
+        'fixed_var': fixed_var
+    }
+
+if __name__ == "__main__":
+    scenarios = [
+        (2, '平坦'),
+        (5, '中等'),
+        (10, '复杂')
+    ]
+    results = []
+    for terrain_std, name in scenarios:
+        result = run_experiment(terrain_std, name)
+        results.append(result)
+
+    df = pd.DataFrame(results)
+    df.to_csv('experiment_results.csv', index=False)
+    print(df)
